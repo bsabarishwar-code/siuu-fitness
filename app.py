@@ -341,7 +341,6 @@ def app_config():
 
 # ── Push subscription ─────────────────────────────────────────────────────
 @app.route("/api/push/subscribe", methods=["POST"])
-@require_auth
 def push_subscribe():
     data     = request.get_json(silent=True) or {}
     endpoint = (data.get("endpoint") or "").strip()

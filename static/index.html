@@ -11,7 +11,7 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="SIUU FITNESS">
   <meta name="theme-color" content="#0A0A0A">
-  <link rel="apple-touch-icon" href="icons/Icon-192.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon.png">
   <link rel="icon" type="image/png" href="favicon.png"/>
   <title>SIUU FITNESS</title>
   <link rel="manifest" href="manifest.json">
@@ -72,12 +72,17 @@
       window._siuuToken = token;
     };
 
+    /* ── Detect homescreen PWA mode ──────────────────────────────────── */
+    window.siuuIsStandalone = function() {
+      return !!(navigator.standalone ||
+                window.matchMedia('(display-mode: standalone)').matches);
+    };
+
     /* ── Request push permission + subscribe ────────────────────────── */
     window.siuuRequestPush = async function(vapidPublicKey) {
       if (!('Notification' in window) || !('serviceWorker' in navigator)) {
         return 'not_supported';
       }
-      // iOS PWA: must be called from user gesture context
       let permission;
       try {
         permission = await Notification.requestPermission();
@@ -101,18 +106,19 @@
         });
 
         const subJson = sub.toJSON();
+        // No auth required — push subscriptions are not sensitive
         const resp = await fetch('/api/push/subscribe', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer ' + window._siuuToken
-          },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(subJson)
         });
         if (!resp.ok) return 'server_error';
         return 'granted';
       } catch(e) {
         console.error('Push subscribe error:', e);
+        // On iOS, pushManager.subscribe fails when not opened as homescreen PWA
+        const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+        if (isIOS && !navigator.standalone) return 'ios_not_standalone';
         return 'error';
       }
     };
