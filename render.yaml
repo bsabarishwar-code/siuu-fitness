@@ -1,0 +1,57 @@
+# Render Blueprint for Siuu Fitness
+# New + -> Blueprint -> pick the siuu-fitness repo
+services:
+  - type: web
+    name: siuu-fitness
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --threads 8 --timeout 60
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.2"
+      - key: SECRET_KEY
+        generateValue: true
+      - key: CRON_SECRET
+        generateValue: true
+      - key: APP_PASSWORD
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: APP_TZ
+        value: Asia/Kolkata
+      - key: EMAIL_ENABLED
+        value: "1"
+      - key: SMTP_HOST
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        value: b.sabarishwar@gmail.com
+      - key: SMTP_PASS
+        sync: false
+      - key: BREVO_API_KEY
+        sync: false
+      - key: WATER_TO
+        sync: false
+      - key: REPORT_TO
+        sync: false
+      - key: WATER_GOAL_ML
+        value: "3000"
+      - key: REMINDER_START_HOUR
+        value: "7"
+      - key: REMINDER_END_HOUR
+        value: "22"
+      - key: REPORT_HOUR
+        value: "21"
+      - key: WATER_SUBJECT
+        sync: false
+      - key: WATER_BODY
+        sync: false
+      - key: REPORT_SUBJECT
+        sync: false
+      - key: VAPID_PUBLIC_KEY
+        value: "BF3IKmUSFvb2XsSHkizW-9yIC4PxMIU0mAJz6fBiAIwHG8TqViRSGpxDrsJQefwz5kfPB8L2EFnJONuwG24Ji7g"
+      - key: VAPID_PRIVATE_KEY
+        sync: false

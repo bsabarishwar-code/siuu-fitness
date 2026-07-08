@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+siuu_fitness.db
+.env
+*.log
+../VAPID_KEYS.txt
