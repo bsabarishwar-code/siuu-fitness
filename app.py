@@ -188,6 +188,10 @@ def init_db():
                 sort_order       INTEGER NOT NULL DEFAULT 0
             )
         """)
+        # Performance indexes on logged_at (speeds up every date-range query)
+        for tbl in ['water_logs', 'macro_logs', 'food_logs', 'nutrient_logs',
+                    'workout_logs', 'progress_logs']:
+            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{tbl}_at ON {tbl}(logged_at)")
         conn.commit()
 
 with app.app_context():
@@ -1008,41 +1012,82 @@ def delete_food_log(log_id):
 @app.route("/api/logs/range")
 @require_auth
 def logs_range():
-    days  = min(int(request.args.get("days", 30)), 90)
-    ph    = "%s" if _pg() else "?"
-    result = []
+    days = min(int(request.args.get("days", 30)), 90)
+    ph = "%s" if _pg() else "?"
     now_local = datetime.now(APP_TZ)
-    for i in range(days - 1, -1, -1):
-        day_local = (now_local - timedelta(days=i)).replace(hour=0, minute=0, second=0, microsecond=0)
-        day_end   = day_local + timedelta(days=1)
-        day_start_utc = day_local.astimezone(timezone.utc)
-        day_end_utc   = day_end.astimezone(timezone.utc)
-        s = day_start_utc if _pg() else day_start_utc.isoformat()
-        e = day_end_utc   if _pg() else day_end_utc.isoformat()
-        with get_db() as conn:
-            cur = conn.cursor()
-            cur.execute(f"SELECT COALESCE(SUM(amount_ml),0) FROM water_logs WHERE logged_at>={ph} AND logged_at<{ph}", (s,e))
-            water = int(cur.fetchone()[0] or 0)
-            cur.execute(f"SELECT COALESCE(SUM(calories),0),COALESCE(SUM(protein_g),0),COALESCE(SUM(carbs_g),0),COALESCE(SUM(fat_g),0) FROM macro_logs WHERE logged_at>={ph} AND logged_at<{ph}", (s,e))
-            mr = cur.fetchone(); macros_cal = float(mr[0] or 0); mp = float(mr[1] or 0); mc = float(mr[2] or 0); mf = float(mr[3] or 0)
-            cur.execute(f"SELECT COALESCE(SUM(calories),0),COALESCE(SUM(protein_g),0),COALESCE(SUM(carbs_g),0),COALESCE(SUM(fat_g),0) FROM food_logs WHERE logged_at>={ph} AND logged_at<{ph}", (s,e))
-            fr = cur.fetchone(); food_cal = float(fr[0] or 0); fp = float(fr[1] or 0); fc = float(fr[2] or 0); ff = float(fr[3] or 0)
-            cur.execute(f"SELECT COUNT(DISTINCT nutrient_id) FROM nutrient_logs WHERE logged_at>={ph} AND logged_at<{ph}", (s,e))
-            micro_count = int(cur.fetchone()[0] or 0)
-            cur.execute(f"SELECT COUNT(*) FROM workout_logs WHERE logged_at>={ph} AND logged_at<{ph}", (s,e))
-            workout_count = int(cur.fetchone()[0] or 0)
-            cur.execute(f"SELECT weight_kg FROM progress_logs WHERE logged_at>={ph} AND logged_at<{ph} ORDER BY logged_at DESC LIMIT 1", (s,e))
-            wrow = cur.fetchone(); weight = float(wrow[0]) if wrow and wrow[0] else None
+    tz_str = os.environ.get("APP_TZ", "Asia/Kolkata")
+
+    start_local = (now_local - timedelta(days=days - 1)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    end_local = now_local.replace(hour=23, minute=59, second=59, microsecond=999999)
+    sv = start_local.astimezone(timezone.utc)
+    ev = end_local.astimezone(timezone.utc)
+    if not _pg():
+        sv, ev = sv.isoformat(), ev.isoformat()
+
+    date_range = [(start_local + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
+
+    # Local-date expression for grouping
+    if _pg():
+        d = f"(logged_at AT TIME ZONE '{tz_str}')::date"
+        dt = f"{d}::text"
+    else:
+        d = dt = "DATE(logged_at)"
+
+    water_map, macro_map, food_map, micro_map, workout_map, weight_map = \
+        {}, {}, {}, {}, {}, {}
+
+    with get_db() as conn:
+        cur = conn.cursor()
+
+        cur.execute(f"SELECT {dt}, COALESCE(SUM(amount_ml),0) FROM water_logs "
+                    f"WHERE logged_at>={ph} AND logged_at<{ph} GROUP BY {d}", (sv, ev))
+        water_map = {str(r[0]): int(r[1]) for r in cur.fetchall()}
+
+        cur.execute(f"SELECT {dt}, COALESCE(SUM(calories),0), COALESCE(SUM(protein_g),0), "
+                    f"COALESCE(SUM(carbs_g),0), COALESCE(SUM(fat_g),0) FROM macro_logs "
+                    f"WHERE logged_at>={ph} AND logged_at<{ph} GROUP BY {d}", (sv, ev))
+        macro_map = {str(r[0]): (float(r[1]), float(r[2]), float(r[3]), float(r[4]))
+                     for r in cur.fetchall()}
+
+        cur.execute(f"SELECT {dt}, COALESCE(SUM(calories),0), COALESCE(SUM(protein_g),0), "
+                    f"COALESCE(SUM(carbs_g),0), COALESCE(SUM(fat_g),0) FROM food_logs "
+                    f"WHERE logged_at>={ph} AND logged_at<{ph} GROUP BY {d}", (sv, ev))
+        food_map = {str(r[0]): (float(r[1]), float(r[2]), float(r[3]), float(r[4]))
+                    for r in cur.fetchall()}
+
+        cur.execute(f"SELECT {dt}, COUNT(DISTINCT nutrient_id) FROM nutrient_logs "
+                    f"WHERE logged_at>={ph} AND logged_at<{ph} GROUP BY {d}", (sv, ev))
+        micro_map = {str(r[0]): int(r[1]) for r in cur.fetchall()}
+
+        cur.execute(f"SELECT {dt}, COUNT(*) FROM workout_logs "
+                    f"WHERE logged_at>={ph} AND logged_at<{ph} GROUP BY {d}", (sv, ev))
+        workout_map = {str(r[0]): int(r[1]) for r in cur.fetchall()}
+
+        if _pg():
+            cur.execute(f"SELECT DISTINCT ON ({d}) {dt}, weight_kg FROM progress_logs "
+                        f"WHERE logged_at>={ph} AND logged_at<{ph} "
+                        f"ORDER BY {d}, logged_at DESC", (sv, ev))
+        else:
+            cur.execute(f"SELECT {dt}, weight_kg FROM progress_logs "
+                        f"WHERE logged_at>={ph} AND logged_at<{ph} GROUP BY {d}", (sv, ev))
+        weight_map = {str(r[0]): (float(r[1]) if r[1] else None) for r in cur.fetchall()}
+
+    result = []
+    for date_str in date_range:
+        m_cal, m_p, m_c, m_f = macro_map.get(date_str, (0.0, 0.0, 0.0, 0.0))
+        f_cal, f_p, f_c, f_f = food_map.get(date_str, (0.0, 0.0, 0.0, 0.0))
         result.append({
-            "date": day_local.strftime("%Y-%m-%d"),
-            "water_ml": water, "water_goal": WATER_GOAL_ML,
-            "total_calories": round(macros_cal + food_cal, 1),
-            "protein_g": round(mp + fp, 1),
-            "carbs_g": round(mc + fc, 1),
-            "fat_g": round(mf + ff, 1),
-            "micro_count": micro_count,
-            "workout_count": workout_count,
-            "weight_kg": weight,
+            "date":          date_str,
+            "water_ml":      water_map.get(date_str, 0),
+            "water_goal":    WATER_GOAL_ML,
+            "total_calories": round(m_cal + f_cal, 1),
+            "protein_g":     round(m_p + f_p, 1),
+            "carbs_g":       round(m_c + f_c, 1),
+            "fat_g":         round(m_f + f_f, 1),
+            "micro_count":   micro_map.get(date_str, 0),
+            "workout_count": workout_map.get(date_str, 0),
+            "weight_kg":     weight_map.get(date_str),
         })
     return jsonify({"days": result})
 
