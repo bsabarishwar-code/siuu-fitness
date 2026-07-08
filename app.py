@@ -1441,18 +1441,18 @@ def healthz():
 
 @app.route("/flutter_bootstrap.js")
 def flutter_bootstrap_js():
-    """Serve flutter_bootstrap.js with Flutter's own service worker disabled.
-    Flutter waits up to 4s for its SW to activate before the app becomes
-    interactive — stripping serviceWorkerSettings makes the app load instantly.
-    Push notifications use /sw.js registered from index.html instead."""
+    """Patch flutter_bootstrap.js on every request:
+    1. Strip serviceWorkerSettings  — prevents 4s freeze waiting for Flutter's blank SW
+    2. Set canvasKitBaseUrl to /canvaskit — loads CanvasKit WASM from our own server
+       instead of Google CDN, eliminating the CDN roundtrip that freezes the app on open
+    """
     path = os.path.join(STATIC, "flutter_bootstrap.js")
     try:
         with open(path, encoding="utf-8") as f:
             content = f.read()
-        if "serviceWorkerSettings" in content:
-            idx = content.rfind("_flutter.loader.load(")
-            if idx >= 0:
-                content = content[:idx] + "_flutter.loader.load({});"
+        idx = content.rfind("_flutter.loader.load(")
+        if idx >= 0:
+            content = content[:idx] + '_flutter.loader.load({"canvasKitBaseUrl":"/canvaskit"});'
         resp = make_response(content)
         resp.headers["Content-Type"] = "application/javascript; charset=utf-8"
         resp.headers["Cache-Control"] = "no-cache, must-revalidate"
@@ -1468,7 +1468,10 @@ def serve_flutter(path):
     static_path = os.path.join(STATIC, path)
     if path and os.path.isfile(static_path):
         resp = make_response(send_from_directory(STATIC, path))
-        if path.endswith((".html", ".js")):
+        if path.startswith("canvaskit/") and path.endswith((".wasm", ".js")):
+            # CanvasKit assets are content-addressed — cache forever
+            resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        elif path.endswith((".html", ".js")):
             resp.headers["Cache-Control"] = "no-cache, must-revalidate"
         return resp
     index = os.path.join(STATIC, "index.html")
