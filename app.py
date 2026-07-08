@@ -278,6 +278,26 @@ def _today_range():
     return start_loc.astimezone(timezone.utc), end_loc.astimezone(timezone.utc)
 
 # ── Setup routes ──────────────────────────────────────────────────────────
+@app.route("/admin/reset")
+def admin_reset():
+    """Wipe all user data so a new user can do fresh first-time setup.
+    Protected by CRON_SECRET so only the app owner can trigger it."""
+    if request.args.get("key") != CRON_SECRET:
+        return jsonify({"error": "forbidden"}), 403
+    tables = [
+        "settings", "push_subscriptions",
+        "nutrient_logs", "water_logs", "macro_logs", "food_logs",
+        "progress_logs", "workout_logs",
+        "custom_diet_meals", "custom_diet_plans",
+        "custom_workout_exercises", "custom_workout_plans",
+    ]
+    with get_db() as conn:
+        cur = conn.cursor()
+        for t in tables:
+            cur.execute(f"DELETE FROM {t}")
+        conn.commit()
+    return jsonify({"ok": True, "reset": True, "message": "All data cleared. App is ready for fresh setup."})
+
 @app.route("/api/setup/status")
 def setup_status():
     return jsonify({"done": is_setup_done()})
