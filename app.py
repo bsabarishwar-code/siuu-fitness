@@ -11,7 +11,7 @@ from datetime import datetime, timezone, timedelta
 from functools import wraps
 from zoneinfo import ZoneInfo
 
-from flask import Flask, request, jsonify, send_from_directory, abort
+from flask import Flask, request, jsonify, send_from_directory, abort, make_response
 
 # ── Force IPv4 (Render has no IPv6 route to Brevo) ───────────────────────
 _orig_getaddrinfo = socket.getaddrinfo
@@ -1439,6 +1439,27 @@ def delete_custom_workout_plan(plan_id):
 def healthz():
     return jsonify({"ok": True, "setup": is_setup_done()})
 
+@app.route("/flutter_bootstrap.js")
+def flutter_bootstrap_js():
+    """Serve flutter_bootstrap.js with Flutter's own service worker disabled.
+    Flutter waits up to 4s for its SW to activate before the app becomes
+    interactive — stripping serviceWorkerSettings makes the app load instantly.
+    Push notifications use /sw.js registered from index.html instead."""
+    path = os.path.join(STATIC, "flutter_bootstrap.js")
+    try:
+        with open(path, encoding="utf-8") as f:
+            content = f.read()
+        if "serviceWorkerSettings" in content:
+            idx = content.rfind("_flutter.loader.load(")
+            if idx >= 0:
+                content = content[:idx] + "_flutter.loader.load({});"
+        resp = make_response(content)
+        resp.headers["Content-Type"] = "application/javascript; charset=utf-8"
+        resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return resp
+    except Exception:
+        return send_from_directory(STATIC, "flutter_bootstrap.js")
+
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
 def serve_flutter(path):
@@ -1446,10 +1467,15 @@ def serve_flutter(path):
         abort(404)
     static_path = os.path.join(STATIC, path)
     if path and os.path.isfile(static_path):
-        return send_from_directory(STATIC, path)
+        resp = make_response(send_from_directory(STATIC, path))
+        if path.endswith((".html", ".js")):
+            resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return resp
     index = os.path.join(STATIC, "index.html")
     if os.path.isfile(index):
-        return send_from_directory(STATIC, "index.html")
+        resp = make_response(send_from_directory(STATIC, "index.html"))
+        resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return resp
     return jsonify({"error": "Flutter build not found. Run Build_Flutter.bat first."}), 404
 
 if __name__ == "__main__":
