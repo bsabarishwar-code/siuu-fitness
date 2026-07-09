@@ -61,7 +61,7 @@ def init_db():
         cur = conn.cursor()
         ai     = "SERIAL"      if _pg() else "INTEGER"
         ts     = "TIMESTAMPTZ" if _pg() else "DATETIME"
-        now_fn = "NOW()"       if _pg() else "datetime('now')"
+        now_fn = "NOW()"       if _pg() else "(datetime('now'))"
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS settings (
@@ -398,6 +398,42 @@ def push_unsubscribe():
         conn.commit()
     return jsonify({"ok": True})
 
+@app.route("/api/push/status")
+@require_auth
+def push_status():
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM push_subscriptions")
+        row = cur.fetchone()
+        count = row[0] if row else 0
+    return jsonify({
+        "subscriptions": count,
+        "vapid_configured": bool(VAPID_PRIVATE_KEY and VAPID_PUBLIC_KEY),
+    })
+
+@app.route("/api/push/test", methods=["POST"])
+@require_auth
+def push_test():
+    name = _user_name()
+    if not VAPID_PRIVATE_KEY or not VAPID_PUBLIC_KEY:
+        return jsonify({"sent": 0, "error": "VAPID keys not configured in Render env vars"}), 400
+    try:
+        from pywebpush import webpush as _wpc  # noqa: F401
+    except ImportError:
+        return jsonify({"sent": 0, "error": "pywebpush not installed"}), 500
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM push_subscriptions")
+        row = cur.fetchone()
+        count = row[0] if row else 0
+    if count == 0:
+        return jsonify({"sent": 0, "error": "No subscriptions saved yet"}), 400
+    sent = _send_push_all(
+        title=f"🔔 Test Notification",
+        body=f"Push is working, {name}! You will receive water reminders here.",
+    )
+    return jsonify({"sent": sent})
+
 # ── Nutrient routes ───────────────────────────────────────────────────────
 @app.route("/api/nutrients/today")
 @require_auth
@@ -707,6 +743,8 @@ def daily_report():
         fr = cur.fetchone()
         cur.execute(f"SELECT COUNT(*) FROM workout_logs WHERE logged_at>={ph} AND logged_at<{ph}", (sv,ev))
         workout_count = int(cur.fetchone()[0] or 0)
+        cur.execute(f"SELECT plan_name, duration_min, notes FROM workout_logs WHERE logged_at>={ph} AND logged_at<{ph} ORDER BY logged_at DESC", (sv,ev))
+        workout_rows = cur.fetchall()
         cur.execute(f"SELECT weight_kg FROM progress_logs WHERE logged_at>={ph} AND logged_at<{ph} ORDER BY logged_at DESC LIMIT 1", (sv,ev))
         wrow = cur.fetchone(); weight_kg = float(wrow[0]) if wrow and wrow[0] else None
     to = _user_recipients()
@@ -724,93 +762,131 @@ def daily_report():
     cal_goal   = int(get_setting("cal_goal", "2500"))
     cal_pct    = min(100, int(total_cal / cal_goal * 100)) if cal_goal else 0
 
+    remaining_cal = max(0, cal_goal - int(total_cal))
+
     def bar(pct, color):
         filled = max(0, min(100, pct))
-        return f'<div style="background:#1C1C1C;height:10px;border-radius:5px;overflow:hidden"><div style="background:{color};height:10px;width:{filled}%;border-radius:5px"></div></div>'
+        return f'<div style="background:#252525;height:8px;border-radius:4px;overflow:hidden;margin-top:6px"><div style="background:{color};height:8px;width:{filled}%;border-radius:4px"></div></div>'
 
-    def kpi(title, value, sub, color, pct):
-        return f'''
-        <td style="padding:8px;width:25%">
-          <div style="background:#1C1C1C;padding:16px;border-top:3px solid {color};border-radius:4px">
-            <div style="color:#666;font-size:10px;letter-spacing:2px;margin-bottom:4px">{title}</div>
-            <div style="color:#E8E8E8;font-size:28px;font-weight:900;line-height:1">{value}</div>
-            <div style="color:#666;font-size:11px;margin:4px 0 8px">{sub}</div>
-            {bar(pct, color)}
+    def macro_cell(label, val_g, goal_g, color):
+        pct2 = min(100, int(val_g / goal_g * 100)) if goal_g else 0
+        return f'''<td style="padding:0 6px;text-align:center;width:33%">
+          <div style="background:#1A1A1A;padding:14px 8px;border-top:3px solid {color}">
+            <div style="color:{color};font-size:22px;font-weight:900;line-height:1">{int(val_g)}g</div>
+            <div style="color:#555;font-size:10px;margin:2px 0">of {int(goal_g)}g</div>
+            {bar(pct2, color)}
+            <div style="color:#666;font-size:9px;letter-spacing:2px;margin-top:6px">{label}</div>
           </div>
         </td>'''
 
-    subject = f"SIUU FITNESS — {name}'s Report · {now_local.strftime('%d %b %Y')}"
-    body = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"></head>
-<body style="margin:0;padding:0;background:#0A0A0A;font-family:Arial,sans-serif">
-<div style="max-width:600px;margin:0 auto;padding:24px 16px">
-  <!-- Header -->
-  <div style="border-bottom:2px solid #CC0000;padding-bottom:16px;margin-bottom:20px">
-    <div style="display:flex;justify-content:space-between;align-items:center">
-      <div>
-        <div style="color:#CC0000;font-size:24px;font-weight:900;letter-spacing:4px">SIUU FITNESS</div>
-        <div style="color:#555;font-size:11px;letter-spacing:2px">DAILY PERFORMANCE REPORT</div>
-      </div>
-      <div style="text-align:right">
-        <div style="color:#888;font-size:12px">{date_str}</div>
-        <div style="color:#E8E8E8;font-size:16px;font-weight:700">{name.upper()}</div>
-      </div>
-    </div>
-  </div>
+    def stat_cell(label, value, sub, color):
+        return f'''<td style="padding:0 4px;text-align:center;width:25%">
+          <div style="background:#1A1A1A;padding:12px 6px;border-bottom:3px solid {color}">
+            <div style="color:{color};font-size:20px;font-weight:900;line-height:1">{value}</div>
+            <div style="color:#555;font-size:10px;margin-top:4px">{sub}</div>
+            <div style="color:#444;font-size:9px;letter-spacing:2px;margin-top:4px">{label}</div>
+          </div>
+        </td>'''
 
-  <!-- KPI Cards -->
-  <div style="font-size:11px;color:#666;letter-spacing:2px;margin-bottom:8px">TODAY'S PERFORMANCE</div>
-  <table style="width:100%;border-collapse:collapse;margin-bottom:20px">
+    subject = f"SIUU FITNESS — {name}'s Daily Report · {now_local.strftime('%d %b %Y')}"
+    body = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#0A0A0A;font-family:Arial,sans-serif;-webkit-text-size-adjust:100%">
+<div style="max-width:560px;margin:0 auto;padding:20px 12px">
+
+  <!-- Header -->
+  <table style="width:100%;border-collapse:collapse;border-bottom:2px solid #CC0000;padding-bottom:16px;margin-bottom:20px">
     <tr>
-      {kpi('WATER', f'{total_water}ml', f'Goal: {WATER_GOAL_ML}ml', '#1E88E5', water_pct)}
-      {kpi('CALORIES', f'{int(total_cal)} kcal', f'Goal: {cal_goal} kcal', '#CC0000', cal_pct)}
-      {kpi('MICROS', f'{micro_met}/28', 'nutrients met', '#2ECC71', micro_pct)}
-      {kpi('WORKOUTS', str(workout_count), 'sessions today', '#FF9800', 100 if workout_count > 0 else 0)}
+      <td style="padding-bottom:16px">
+        <div style="color:#CC0000;font-size:22px;font-weight:900;letter-spacing:4px">SIUU FITNESS</div>
+        <div style="color:#444;font-size:10px;letter-spacing:3px;margin-top:2px">DAILY PERFORMANCE REPORT</div>
+      </td>
+      <td style="padding-bottom:16px;text-align:right;vertical-align:top">
+        <div style="color:#888;font-size:11px">{date_str}</div>
+        <div style="color:#E8E8E8;font-size:15px;font-weight:700;margin-top:2px">{name.upper()}</div>
+      </td>
     </tr>
   </table>
 
-  <!-- Macros -->
-  <div style="background:#111;padding:16px;margin-bottom:16px;border-radius:4px">
-    <div style="color:#888;font-size:11px;letter-spacing:2px;margin-bottom:12px">MACRONUTRIENTS</div>
-    <table style="width:100%">
+  <!-- Calorie Dashboard Section -->
+  <div style="background:#111111;border:1px solid #222;margin-bottom:12px">
+
+    <!-- Gauge simulation -->
+    <div style="text-align:center;padding:28px 20px 12px">
+      <div style="color:#555;font-size:10px;letter-spacing:4px;margin-bottom:16px">CALORIES</div>
+      <!-- Arc simulation: top border makes a partial circle effect -->
+      <div style="display:inline-block;position:relative;width:160px;height:88px;overflow:hidden">
+        <div style="position:absolute;bottom:0;left:0;right:0;
+          width:160px;height:160px;
+          border-radius:50%;
+          border:14px solid #222222;
+          box-sizing:border-box">
+        </div>
+        <!-- Progress overlay (left half) -->
+        <div style="position:absolute;bottom:0;left:0;
+          width:160px;height:160px;
+          border-radius:50%;
+          border:14px solid transparent;
+          border-left:14px solid #CC0000;
+          border-top:14px solid {('#CC0000' if cal_pct >= 50 else 'transparent')};
+          box-sizing:border-box;
+          transform:rotate({max(0,min(180,(cal_pct*1.8)-90))}deg);
+          transform-origin:center center">
+        </div>
+      </div>
+      <!-- Big number -->
+      <div style="margin-top:12px">
+        <div style="color:{'#2ECC71' if cal_pct>=100 else '#FFFFFF'};font-size:52px;font-weight:900;line-height:1;letter-spacing:-2px">{remaining_cal if cal_pct<100 else int(total_cal)}</div>
+        <div style="color:{'#2ECC71' if cal_pct>=100 else '#888'};font-size:11px;letter-spacing:4px;margin-top:6px">{'GOAL REACHED' if cal_pct>=100 else 'REMAINING'}</div>
+        <div style="background:rgba(204,0,0,0.12);border:1px solid rgba(204,0,0,0.25);color:#CC0000;font-size:11px;padding:5px 14px;display:inline-block;margin-top:10px">{int(total_cal)} / {cal_goal} kcal consumed</div>
+      </div>
+    </div>
+
+    <!-- Macro row -->
+    <table style="width:100%;border-collapse:collapse;border-top:1px solid #222">
       <tr>
-        <td style="padding:6px 0">
-          <div style="display:flex;justify-content:space-between;margin-bottom:4px">
-            <span style="color:#E53935;font-size:12px;font-weight:700">PROTEIN</span>
-            <span style="color:#888;font-size:11px">{int(protein)}g</span>
-          </div>
-          {bar(min(100,int(protein/150*100)), '#E53935')}
-        </td>
-      </tr>
-      <tr>
-        <td style="padding:6px 0">
-          <div style="display:flex;justify-content:space-between;margin-bottom:4px">
-            <span style="color:#FF9800;font-size:12px;font-weight:700">CARBOHYDRATES</span>
-            <span style="color:#888;font-size:11px">{int(carbs)}g</span>
-          </div>
-          {bar(min(100,int(carbs/250*100)), '#FF9800')}
-        </td>
-      </tr>
-      <tr>
-        <td style="padding:6px 0">
-          <div style="display:flex;justify-content:space-between;margin-bottom:4px">
-            <span style="color:#9C27B0;font-size:12px;font-weight:700">FAT</span>
-            <span style="color:#888;font-size:11px">{int(fat)}g</span>
-          </div>
-          {bar(min(100,int(fat/70*100)), '#9C27B0')}
-        </td>
+        {macro_cell('PROTEIN', protein, 150, '#E53935')}
+        {macro_cell('CARBS',   carbs,   250, '#FF9800')}
+        {macro_cell('FAT',     fat,      70, '#AB47BC')}
       </tr>
     </table>
   </div>
 
-  <!-- Weight -->
-  {'<div style="background:#111;padding:16px;margin-bottom:16px;border-radius:4px"><div style="color:#888;font-size:11px;letter-spacing:2px;margin-bottom:8px">BODY WEIGHT</div><div style="color:#E8E8E8;font-size:36px;font-weight:900">'+str(weight_kg)+' kg</div></div>' if weight_kg else ''}
+  <!-- Quick stats row -->
+  <table style="width:100%;border-collapse:collapse;margin-bottom:12px">
+    <tr>
+      {stat_cell('WATER',    f'{total_water}ml' if total_water<1000 else f'{total_water/1000:.1f}L', f'of {WATER_GOAL_ML//1000}L goal', '#1E88E5')}
+      {stat_cell('MICROS',   f'{micro_met}/28', 'nutrients met', '#2ECC71')}
+      {stat_cell('WORKOUTS', str(workout_count), 'sessions today', '#CC0000')}
+      {stat_cell('SCORE',    f'{micro_pct}%', 'micro nutrition', '#FF9800')}
+    </tr>
+  </table>
+
+  <!-- Water progress bar -->
+  <div style="background:#111111;border:1px solid #222;padding:16px;margin-bottom:12px">
+    <table style="width:100%;border-collapse:collapse">
+      <tr>
+        <td style="color:#1E88E5;font-size:11px;letter-spacing:2px;font-weight:700">💧 WATER</td>
+        <td style="text-align:right;color:#1E88E5;font-size:14px;font-weight:900">
+          {f'{total_water}ml' if total_water<1000 else f'{total_water/1000:.1f}L'}
+          <span style="color:#444;font-size:11px;font-weight:400"> / {WATER_GOAL_ML//1000}L</span>
+        </td>
+      </tr>
+    </table>
+    {bar(water_pct, '#1E88E5')}
+  </div>
+
+  <!-- Workouts section -->
+  {('<div style="background:#111111;border:1px solid #222;margin-bottom:12px"><div style="padding:12px 16px;border-bottom:1px solid #222;display:flex;justify-content:space-between;align-items:center"><span style="color:#CC0000;font-size:10px;font-weight:900;letter-spacing:2px">WORKOUTS TODAY</span><span style="color:#555;font-size:11px">'+str(workout_count)+' session'+('s' if workout_count!=1 else '')+'</span></div>'+''.join(['<div style="padding:12px 16px;border-bottom:1px solid #1A1A1A;display:flex;justify-content:space-between;align-items:center"><div><div style="color:#E8E8E8;font-size:13px;font-weight:700">'+str(r[0])+'</div>'+(('<div style="color:#666;font-size:11px;margin-top:2px;font-style:italic">'+str(r[2])+'</div>') if r[2] else '')+'</div><div style="color:#CC0000;font-size:13px;font-weight:900">'+str(r[1])+' min</div></div>' for r in workout_rows])+'</div>') if workout_rows else ''}
+
+  {'<div style="background:#111111;border:1px solid #222;padding:16px;margin-bottom:12px"><div style="color:#888;font-size:10px;letter-spacing:2px;margin-bottom:6px">BODY WEIGHT</div><div style="color:#E8E8E8;font-size:36px;font-weight:900;line-height:1">'+str(weight_kg)+' kg</div></div>' if weight_kg else ''}
 
   <!-- Footer -->
-  <div style="border-top:1px solid #1C1C1C;padding-top:16px;text-align:center">
-    <div style="color:#CC0000;font-weight:700;letter-spacing:2px;font-size:13px">TRACK. DOMINATE. REPEAT.</div>
-    <div style="color:#333;font-size:10px;margin-top:8px">SIUU FITNESS · Powered by dedication</div>
+  <div style="border-top:1px solid #1C1C1C;padding-top:16px;text-align:center;margin-top:4px">
+    <div style="color:#CC0000;font-weight:900;letter-spacing:3px;font-size:12px">TRACK · DOMINATE · REPEAT</div>
+    <div style="color:#333;font-size:10px;margin-top:8px">SIUU FITNESS — Your daily performance, delivered.</div>
   </div>
+
 </div>
 </body></html>"""
     try:
