@@ -1454,44 +1454,23 @@ def delete_custom_workout_plan(plan_id):
         conn.commit()
     return jsonify({"ok": True})
 
-# ── Health + Flutter SPA ──────────────────────────────────────────────────
+# ── Health + React SPA ───────────────────────────────────────────────────
 @app.route("/healthz")
 def healthz():
     return jsonify({"ok": True, "setup": is_setup_done()})
 
-@app.route("/flutter_bootstrap.js")
-def flutter_bootstrap_js():
-    """Patch flutter_bootstrap.js on every request:
-    1. Strip serviceWorkerSettings  — prevents 4s freeze waiting for Flutter's blank SW
-    2. Set canvasKitBaseUrl to /canvaskit — loads CanvasKit WASM from our own server
-       instead of Google CDN, eliminating the CDN roundtrip that freezes the app on open
-    """
-    path = os.path.join(STATIC, "flutter_bootstrap.js")
-    try:
-        with open(path, encoding="utf-8") as f:
-            content = f.read()
-        idx = content.rfind("_flutter.loader.load(")
-        if idx >= 0:
-            content = content[:idx] + '_flutter.loader.load({"canvasKitBaseUrl":"/canvaskit"});'
-        resp = make_response(content)
-        resp.headers["Content-Type"] = "application/javascript; charset=utf-8"
-        resp.headers["Cache-Control"] = "no-cache, must-revalidate"
-        return resp
-    except Exception:
-        return send_from_directory(STATIC, "flutter_bootstrap.js")
-
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
-def serve_flutter(path):
-    if path.startswith(("api/", "tasks/", "healthz")):
+def serve_spa(path):
+    if path.startswith(("api/", "tasks/", "healthz", "admin/")):
         abort(404)
     static_path = os.path.join(STATIC, path)
     if path and os.path.isfile(static_path):
         resp = make_response(send_from_directory(STATIC, path))
-        if path.startswith("canvaskit/") and path.endswith((".wasm", ".js")):
-            # CanvasKit assets are content-addressed — cache forever
+        # Vite outputs content-addressed hashed assets in /assets/ — cache forever
+        if path.startswith("assets/"):
             resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
-        elif path.endswith((".html", ".js")):
+        else:
             resp.headers["Cache-Control"] = "no-cache, must-revalidate"
         return resp
     index = os.path.join(STATIC, "index.html")
@@ -1499,7 +1478,7 @@ def serve_flutter(path):
         resp = make_response(send_from_directory(STATIC, "index.html"))
         resp.headers["Cache-Control"] = "no-cache, must-revalidate"
         return resp
-    return jsonify({"error": "Flutter build not found. Run Build_Flutter.bat first."}), 404
+    return jsonify({"error": "React build not found. Run npm run build in siuu_fitness_react."}), 404
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
