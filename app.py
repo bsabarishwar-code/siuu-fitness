@@ -522,7 +522,8 @@ def water_today():
             (start if _pg() else start.isoformat(), end if _pg() else end.isoformat()),
         )
         total = int(cur.fetchone()[0] or 0)
-    return jsonify({"total_ml": total, "goal_ml": WATER_GOAL_ML})
+    goal = int(get_setting("goal_water_ml", str(WATER_GOAL_ML)))
+    return jsonify({"total_ml": total, "goal_ml": goal})
 
 @app.route("/api/water/log", methods=["POST"])
 @require_auth
@@ -941,6 +942,32 @@ def log_macro():
             row_id = cur.lastrowid
         conn.commit()
     return jsonify({"id": row_id, "calories": calories})
+
+# ── Goals ─────────────────────────────────────────────────────────────────────
+@app.route("/api/goals")
+@require_auth
+def get_goals():
+    return jsonify({
+        "calories":  int(get_setting("goal_calories",  "2500")),
+        "protein_g": int(get_setting("goal_protein_g", "150")),
+        "carbs_g":   int(get_setting("goal_carbs_g",   "250")),
+        "fat_g":     int(get_setting("goal_fat_g",     "70")),
+        "water_ml":  int(get_setting("goal_water_ml",  str(WATER_GOAL_ML))),
+    })
+
+@app.route("/api/goals", methods=["POST"])
+@require_auth
+def save_goals():
+    data = request.get_json(silent=True) or {}
+    def _int(key, default):
+        try: return max(1, int(data[key]))
+        except Exception: return default
+    set_setting("goal_calories",  str(_int("calories",  2500)))
+    set_setting("goal_protein_g", str(_int("protein_g", 150)))
+    set_setting("goal_carbs_g",   str(_int("carbs_g",   250)))
+    set_setting("goal_fat_g",     str(_int("fat_g",     70)))
+    set_setting("goal_water_ml",  str(_int("water_ml",  WATER_GOAL_ML)))
+    return jsonify({"ok": True})
 
 # ── Settings (diet plan, etc.) ─────────────────────────────────────────────────
 @app.route("/api/settings/diet-plan", methods=["POST"])
