@@ -192,7 +192,12 @@ def init_db():
         for tbl in ['water_logs', 'macro_logs', 'food_logs', 'nutrient_logs',
                     'workout_logs', 'progress_logs']:
             cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{tbl}_at ON {tbl}(logged_at)")
-        conn.commit()
+        # Migrations — safe to run on existing DB
+        try:
+            cur.execute("ALTER TABLE workout_logs ADD COLUMN calories_burned INTEGER DEFAULT 0")
+            conn.commit()
+        except Exception:
+            pass  # Column already exists
 
 with app.app_context():
     try:
@@ -681,7 +686,9 @@ def water_reminder():
         abort(403)
     now_local = datetime.now(APP_TZ)
     hour = now_local.hour
-    if not (REMINDER_START_HOUR <= hour < REMINDER_END_HOUR):
+    r_start = int(get_setting("reminder_start_hour", str(REMINDER_START_HOUR)))
+    r_end   = int(get_setting("reminder_end_hour",   str(REMINDER_END_HOUR)))
+    if not (r_start <= hour < r_end):
         return jsonify({"status": "outside_hours", "hour": hour})
 
     name = _user_name()
@@ -726,7 +733,8 @@ def daily_report():
     if not hmac.compare_digest(request.args.get("key",""), CRON_SECRET):
         abort(403)
     now_local = datetime.now(APP_TZ)
-    if now_local.hour != REPORT_HOUR:
+    report_h  = int(get_setting("report_hour_pref", str(REPORT_HOUR)))
+    if now_local.hour != report_h:
         return jsonify({"status": "wrong_hour", "hour": now_local.hour})
     start, end = _today_range()
     ph = "%s" if _pg() else "?"
@@ -969,6 +977,45 @@ def save_goals():
     set_setting("goal_water_ml",  str(_int("water_ml",  WATER_GOAL_ML)))
     return jsonify({"ok": True})
 
+# ── Reminder preferences ──────────────────────────────────────────────────────
+@app.route("/api/reminder-prefs")
+@require_auth
+def get_reminder_prefs():
+    return jsonify({
+        "reminder_start": int(get_setting("reminder_start_hour", str(REMINDER_START_HOUR))),
+        "reminder_end":   int(get_setting("reminder_end_hour",   str(REMINDER_END_HOUR))),
+        "report_hour":    int(get_setting("report_hour_pref",    str(REPORT_HOUR))),
+    })
+
+@app.route("/api/reminder-prefs", methods=["POST"])
+@require_auth
+def save_reminder_prefs():
+    data = request.get_json(silent=True) or {}
+    def _hr(key, default):
+        try: return max(0, min(23, int(data[key])))
+        except Exception: return default
+    set_setting("reminder_start_hour", str(_hr("reminder_start", REMINDER_START_HOUR)))
+    set_setting("reminder_end_hour",   str(_hr("reminder_end",   REMINDER_END_HOUR)))
+    set_setting("report_hour_pref",    str(_hr("report_hour",    REPORT_HOUR)))
+    return jsonify({"ok": True})
+
+# ── Rest day ───────────────────────────────────────────────────────────────────
+@app.route("/api/rest-day")
+@require_auth
+def get_rest_day():
+    date_str = request.args.get("date", datetime.now(APP_TZ).strftime("%Y-%m-%d"))
+    is_rest = get_setting(f"rest_{date_str}", "0") == "1"
+    return jsonify({"date": date_str, "is_rest": is_rest})
+
+@app.route("/api/rest-day", methods=["POST"])
+@require_auth
+def set_rest_day():
+    data     = request.get_json(silent=True) or {}
+    date_str = (data.get("date") or datetime.now(APP_TZ).strftime("%Y-%m-%d")).strip()
+    is_rest  = bool(data.get("is_rest", False))
+    set_setting(f"rest_{date_str}", "1" if is_rest else "0")
+    return jsonify({"ok": True, "date": date_str, "is_rest": is_rest})
+
 # ── Settings (diet plan, etc.) ─────────────────────────────────────────────────
 @app.route("/api/settings/diet-plan", methods=["POST"])
 @require_auth
@@ -1031,25 +1078,26 @@ def progress_history():
 @app.route("/api/workout/log", methods=["POST"])
 @require_auth
 def log_workout():
-    data         = request.get_json(silent=True) or {}
-    plan_id      = (data.get("plan_id")   or "").strip()
-    plan_name    = (data.get("plan_name") or "").strip()
-    duration_min = int(data.get("duration_min") or 0)
-    notes        = (data.get("notes") or "").strip() or None
-    now_utc      = datetime.now(timezone.utc)
+    data             = request.get_json(silent=True) or {}
+    plan_id          = (data.get("plan_id")   or "").strip()
+    plan_name        = (data.get("plan_name") or "").strip()
+    duration_min     = int(data.get("duration_min") or 0)
+    notes            = (data.get("notes") or "").strip() or None
+    calories_burned  = int(data.get("calories_burned") or 0)
+    now_utc          = datetime.now(timezone.utc)
     with get_db() as conn:
         cur = conn.cursor()
         if _pg():
             cur.execute(
-                "INSERT INTO workout_logs (plan_id,plan_name,duration_min,notes,logged_at) "
-                "VALUES (%s,%s,%s,%s,%s) RETURNING id",
-                (plan_id, plan_name, duration_min, notes, now_utc))
+                "INSERT INTO workout_logs (plan_id,plan_name,duration_min,notes,calories_burned,logged_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
+                (plan_id, plan_name, duration_min, notes, calories_burned, now_utc))
             row_id = cur.fetchone()[0]
         else:
             cur.execute(
-                "INSERT INTO workout_logs (plan_id,plan_name,duration_min,notes,logged_at) "
-                "VALUES (?,?,?,?,?)",
-                (plan_id, plan_name, duration_min, notes, now_utc.isoformat()))
+                "INSERT INTO workout_logs (plan_id,plan_name,duration_min,notes,calories_burned,logged_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (plan_id, plan_name, duration_min, notes, calories_burned, now_utc.isoformat()))
             row_id = cur.lastrowid
         conn.commit()
     return jsonify({"id": row_id})
@@ -1062,13 +1110,14 @@ def workout_history():
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute(
-            f"SELECT id,plan_id,plan_name,duration_min,notes,logged_at "
+            f"SELECT id,plan_id,plan_name,duration_min,notes,calories_burned,logged_at "
             f"FROM workout_logs ORDER BY logged_at DESC LIMIT {ph}", (limit,))
         rows = cur.fetchall()
     return jsonify({
         "logs": [{"id": r[0], "plan_id": r[1], "plan_name": r[2],
                   "duration_min": r[3], "notes": r[4],
-                  "logged_at": str(r[5])} for r in rows]
+                  "calories_burned": int(r[5] or 0),
+                  "logged_at": str(r[6])} for r in rows]
     })
 
 # ── Food diary routes ─────────────────────────────────────────────────────────
