@@ -755,7 +755,9 @@ def daily_report():
         abort(403)
     now_local = datetime.now(APP_TZ)
     report_h  = int(get_setting("report_hour_pref", str(REPORT_HOUR)))
-    if now_local.hour != report_h:
+    force     = request.args.get("force", "0") == "1"
+    override_to = request.args.get("to", "").strip()
+    if not force and now_local.hour != report_h:
         return jsonify({"status": "wrong_hour", "hour": now_local.hour})
     start, end = _today_range()
     ph = "%s" if _pg() else "?"
@@ -777,7 +779,7 @@ def daily_report():
         workout_rows = cur.fetchall()
         cur.execute(f"SELECT weight_kg FROM progress_logs WHERE logged_at>={ph} AND logged_at<{ph} ORDER BY logged_at DESC LIMIT 1", (sv,ev))
         wrow = cur.fetchone(); weight_kg = float(wrow[0]) if wrow and wrow[0] else None
-    to = _user_recipients()
+    to = [override_to] if override_to else _user_recipients()
     if not to:
         return jsonify({"status": "no_recipients"})
     name = _user_name()
