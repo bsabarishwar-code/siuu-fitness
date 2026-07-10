@@ -188,9 +188,30 @@ def init_db():
                 sort_order       INTEGER NOT NULL DEFAULT 0
             )
         """)
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS exercise_logs (
+                id            {ai} PRIMARY KEY,
+                session_id    TEXT NOT NULL DEFAULT '',
+                exercise_name TEXT NOT NULL,
+                set_number    INTEGER NOT NULL DEFAULT 1,
+                reps          INTEGER NOT NULL DEFAULT 0,
+                weight_kg     REAL NOT NULL DEFAULT 0,
+                logged_at     {ts} NOT NULL DEFAULT {now_fn}
+            )
+        """)
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS exercise_prs (
+                id            {ai} PRIMARY KEY,
+                exercise_name TEXT NOT NULL UNIQUE,
+                best_1rm      REAL NOT NULL DEFAULT 0,
+                best_weight   REAL NOT NULL DEFAULT 0,
+                best_reps     INTEGER NOT NULL DEFAULT 0,
+                achieved_at   {ts} NOT NULL DEFAULT {now_fn}
+            )
+        """)
         # Performance indexes on logged_at (speeds up every date-range query)
         for tbl in ['water_logs', 'macro_logs', 'food_logs', 'nutrient_logs',
-                    'workout_logs', 'progress_logs']:
+                    'workout_logs', 'progress_logs', 'exercise_logs']:
             cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{tbl}_at ON {tbl}(logged_at)")
         # Migrations — safe to run on existing DB
         try:
@@ -1605,6 +1626,138 @@ def delete_custom_workout_plan(plan_id):
         cur.execute(f"DELETE FROM custom_workout_plans WHERE id={ph}", (plan_id,))
         conn.commit()
     return jsonify({"ok": True})
+
+# ── Exercise log + PR routes ─────────────────────────────────────────────
+
+@app.route("/api/exercise-logs", methods=["GET", "POST"])
+@require_auth
+def exercise_logs_route():
+    ph = "%s" if _pg() else "?"
+    if request.method == "GET":
+        start, end = _today_range()
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute(f"""
+                SELECT id, session_id, exercise_name, set_number, reps, weight_kg, logged_at
+                FROM exercise_logs WHERE logged_at >= {ph} AND logged_at < {ph}
+                ORDER BY logged_at ASC
+            """, (start, end))
+            rows = cur.fetchall()
+        logs = [{"id": r[0], "session_id": r[1], "exercise_name": r[2],
+                 "set_number": r[3], "reps": r[4], "weight_kg": r[5],
+                 "logged_at": r[6].isoformat() if hasattr(r[6], "isoformat") else str(r[6])} for r in rows]
+        return jsonify({"logs": logs})
+
+    data       = request.json
+    exercise   = (data.get("exercise_name") or "").strip()
+    reps       = int(data.get("reps") or 0)
+    weight     = float(data.get("weight_kg") or 0)
+    set_num    = int(data.get("set_number") or 1)
+    session_id = data.get("session_id") or ""
+    if not exercise or reps <= 0:
+        return jsonify({"error": "exercise_name and reps required"}), 400
+
+    new_1rm = round(weight * (1 + reps / 30), 1) if weight > 0 else 0
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        if _pg():
+            cur.execute("""INSERT INTO exercise_logs (session_id,exercise_name,set_number,reps,weight_kg)
+                           VALUES (%s,%s,%s,%s,%s) RETURNING id""",
+                        (session_id, exercise, set_num, reps, weight))
+            log_id = cur.fetchone()[0]
+        else:
+            cur.execute("INSERT INTO exercise_logs (session_id,exercise_name,set_number,reps,weight_kg) VALUES (?,?,?,?,?)",
+                        (session_id, exercise, set_num, reps, weight))
+            log_id = cur.lastrowid
+
+        is_pr = False
+        cur.execute(f"SELECT best_1rm FROM exercise_prs WHERE exercise_name={ph}", (exercise,))
+        existing = cur.fetchone()
+        if not existing:
+            if _pg():
+                cur.execute("INSERT INTO exercise_prs (exercise_name,best_1rm,best_weight,best_reps) VALUES (%s,%s,%s,%s)",
+                            (exercise, new_1rm, weight, reps))
+            else:
+                cur.execute("INSERT INTO exercise_prs (exercise_name,best_1rm,best_weight,best_reps) VALUES (?,?,?,?)",
+                            (exercise, new_1rm, weight, reps))
+            is_pr = new_1rm > 0
+        elif new_1rm > (existing[0] or 0):
+            if _pg():
+                cur.execute("UPDATE exercise_prs SET best_1rm=%s,best_weight=%s,best_reps=%s,achieved_at=NOW() WHERE exercise_name=%s",
+                            (new_1rm, weight, reps, exercise))
+            else:
+                cur.execute("UPDATE exercise_prs SET best_1rm=?,best_weight=?,best_reps=?,achieved_at=datetime('now') WHERE exercise_name=?",
+                            (new_1rm, weight, reps, exercise))
+            is_pr = True
+        conn.commit()
+    return jsonify({"id": log_id, "is_pr": is_pr, "new_1rm": new_1rm})
+
+
+@app.route("/api/exercise-logs/<int:log_id>", methods=["DELETE"])
+@require_auth
+def delete_exercise_log(log_id):
+    ph = "%s" if _pg() else "?"
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(f"DELETE FROM exercise_logs WHERE id={ph}", (log_id,))
+        conn.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/exercise-prs")
+@require_auth
+def exercise_prs_route():
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT exercise_name,best_1rm,best_weight,best_reps,achieved_at FROM exercise_prs ORDER BY exercise_name ASC")
+        rows = cur.fetchall()
+    prs = [{"exercise_name": r[0], "best_1rm": round(float(r[1]), 1), "best_weight": r[2],
+             "best_reps": r[3], "achieved_at": r[4].isoformat() if hasattr(r[4], "isoformat") else str(r[4])} for r in rows]
+    return jsonify({"prs": prs})
+
+
+@app.route("/api/workout-streak")
+@require_auth
+def workout_streak():
+    """Consecutive active days ending today (or yesterday)."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        if _pg():
+            tz_str = str(APP_TZ)
+            cur.execute(f"""
+                SELECT DISTINCT (logged_at AT TIME ZONE 'UTC' AT TIME ZONE %s)::date AS day
+                FROM (SELECT logged_at FROM workout_logs UNION ALL SELECT logged_at FROM exercise_logs) c
+                ORDER BY day DESC LIMIT 90
+            """, (tz_str,))
+        else:
+            cur.execute("""
+                SELECT DISTINCT DATE(logged_at) AS day
+                FROM (SELECT logged_at FROM workout_logs UNION ALL SELECT logged_at FROM exercise_logs) c
+                ORDER BY day DESC LIMIT 90
+            """)
+        rows = cur.fetchall()
+
+    if not rows:
+        return jsonify({"streak": 0, "last_workout_date": None})
+
+    today = datetime.now(APP_TZ).date()
+    dates = set()
+    for r in rows:
+        d = r[0]
+        if isinstance(d, str):
+            d = datetime.strptime(d[:10], "%Y-%m-%d").date()
+        dates.add(d)
+
+    check = today if today in dates else today - timedelta(days=1)
+    streak = 0
+    while check in dates:
+        streak += 1
+        check -= timedelta(days=1)
+
+    last = max(dates)
+    return jsonify({"streak": streak, "last_workout_date": str(last)})
+
 
 # ── Health + React SPA ───────────────────────────────────────────────────
 @app.route("/healthz")
