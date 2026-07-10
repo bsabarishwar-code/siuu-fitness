@@ -1761,6 +1761,46 @@ def workout_streak():
     return jsonify({"streak": streak, "last_workout_date": str(last)})
 
 
+# ── Email debug ──────────────────────────────────────────────────────────
+@app.route("/tasks/send-test-email")
+def send_test_email():
+    if not hmac.compare_digest(request.args.get("key", ""), CRON_SECRET):
+        abort(403)
+    to_addr = request.args.get("to", "").strip()
+    if not to_addr:
+        return jsonify({"error": "Pass ?to=email"}), 400
+
+    config = {
+        "EMAIL_ENABLED": EMAIL_ENABLED,
+        "BREVO_API_KEY_set": bool(BREVO_API_KEY),
+        "SMTP_PASS_set": bool(SMTP_PASS),
+        "SMTP_USER": SMTP_USER,
+        "method": "brevo" if BREVO_API_KEY else ("smtp" if SMTP_PASS else "none"),
+    }
+    if not EMAIL_ENABLED:
+        return jsonify({"config": config, "error": "EMAIL_ENABLED is false"})
+    if not BREVO_API_KEY and not SMTP_PASS:
+        return jsonify({"config": config, "error": "No email credentials configured — set BREVO_API_KEY or SMTP_PASS in Render env vars"})
+
+    subject = "SIUU FITNESS — Test Email"
+    body = """<!DOCTYPE html><html><body style="background:#0A0A0A;font-family:Arial;padding:20px">
+<div style="max-width:500px;margin:0 auto;color:#E8E8E8">
+  <div style="color:#CC0000;font-size:22px;font-weight:900;letter-spacing:4px;border-bottom:2px solid #CC0000;padding-bottom:12px;margin-bottom:20px">SIUU FITNESS</div>
+  <p style="font-size:16px">This is a test email confirming your daily report delivery is working correctly.</p>
+  <p style="color:#888;font-size:13px">You will receive your daily performance report every evening at the configured time.</p>
+  <div style="margin-top:20px;color:#CC0000;font-weight:700;letter-spacing:2px;font-size:11px">TRACK · DOMINATE · REPEAT</div>
+</div>
+</body></html>"""
+    try:
+        if BREVO_API_KEY:
+            result = _send_brevo([to_addr], subject, body)
+        else:
+            _send_smtp([to_addr], subject, body)
+            result = {"smtp": "ok"}
+        return jsonify({"config": config, "status": "sent", "to": to_addr, "result": result})
+    except Exception as ex:
+        return jsonify({"config": config, "status": "error", "error": str(ex)}), 500
+
 # ── Health + React SPA ───────────────────────────────────────────────────
 @app.route("/healthz")
 def healthz():
